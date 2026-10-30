@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#176b45">
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Yohan Store">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Yohan Store POS</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23176b45'/%3E%3Ctext x='32' y='45' font-size='40' font-family='Arial' font-weight='bold' text-anchor='middle' fill='white'%3EY%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  
+  <section id="loginScreen" class="login-screen">
+    <div class="login-card">
+      <div class="brand-icon">Y</div>
+      <h1>Yohan Store</h1>
+      <p>Point of Sale System</p>
+      <div class="login-conn">
+        <span id="loginConnectionStatus" class="conn-status is-online" data-connection-status role="status" aria-live="polite">
+          <span class="conn-dot" aria-hidden="true"></span><span class="conn-label">Online</span>
+        </span>
+      </div>
+
+      <form id="loginForm">
+        <label for="loginEmail">Email Address</label>
+        <input
+          id="loginEmail"
+          type="email"
+          placeholder="Enter your email"
+          autocomplete="username"
+          required
+        >
+
+        <label for="loginPassword">Password</label>
+        <input
+          id="loginPassword"
+          type="password"
+          placeholder="Enter your password"
+          autocomplete="current-password"
+          required
+        >
+
+        <button type="submit" class="primary-btn">
+          Sign In
+        </button>
+
+        <p id="loginMessage" role="alert"></p>
+      </form>
+    </div>
+  </section>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">Y</div>
+      <div>
+        <h1>Yohan Store</h1>
+        <p>Point of Sale System</p>
+      </div>
+    </div>
+
+    <div class="role-area">
+      <span id="connectionStatus" class="conn-status is-online" data-connection-status role="status" aria-live="polite">
+        <span class="conn-dot" aria-hidden="true"></span><span class="conn-label">Online</span>
+      </span>
+      <div class="user-info">
+        <strong id="userName"></strong>
+        <span id="userRole" class="pill"></span>
+      </div>
+      <button id="enableNotifBtn" type="button" class="secondary-btn" hidden>🔔 Enable Notifications</button>
+      <button id="logoutBtn" type="button" class="secondary-btn">Log out</button>
+    </div>
+  </header>
+
+  <div class="demo-notice">
+    Signed in — what you can see and do depends on the role assigned to your account.
+  </div>
+
+  <div id="offlineBanner" class="offline-banner" role="status" hidden>
+    You are offline. The app can open, but sales, restocking, requests and consumption need an internet connection.
+  </div>
+
+  <div class="app-layout">
+    <aside class="sidebar">
+      <p class="nav-heading">MAIN MENU</p>
+      <button class="nav-btn active" data-page="cashier">🛒 Cashier</button>
+      <button class="nav-btn" data-page="inventory">📦 Inventory</button>
+      <button class="nav-btn" data-page="requests">📋 Staff Requests</button>
+      <button class="nav-btn" data-page="consumption">🍽️ Store Consumption</button>
+      <button class="nav-btn" data-page="reports">📊 Income Reports</button>
+      <button class="nav-btn admin-only" data-page="productReport">📈 Product Report</button>
+      <div class="sidebar-footer">
+        <span class="status-dot"></span> Data stored in Firebase
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <section id="cashier" class="page active">
+        <div class="page-heading">
+          <div>
+            <h2>Cashier</h2>
+            <p>Choose products and prepare a transaction.</p>
+          </div>
+          <span id="cartCount" class="pill">0 items</span>
+        </div>
+
+        <div class="cashier-grid">
+          <div class="panel">
+            <div class="panel-heading">
+              <h3>Available Products</h3>
+              <input id="productSearch" type="search" placeholder="Search products...">
+            </div>
+            <div id="productGrid" class="product-grid"></div>
+          </div>
+
+          <div class="panel cart-panel">
+            <h3>Current Cart</h3>
+            <div id="cartItems" class="cart-items"></div>
+
+            <div class="total-row">
+              <span>Total</span>
+              <strong id="cartTotal">₱0.00</strong>
+            </div>
+
+            <label for="cashReceived">Customer cash received (₱)</label>
+            <input id="cashReceived" type="number" min="0" step="0.01"
+              placeholder="Enter amount received">
+
+            <div class="change-row">
+              <span>Change</span>
+              <strong id="changeAmount">₱0.00</strong>
+            </div>
+
+            <p id="paymentMessage" class="message" aria-live="polite"></p>
+
+            <div class="button-stack">
+              <button id="submitTransaction" class="primary-btn">
+                Submit Transaction
+              </button>
+              <button id="clearCart" class="secondary-btn">Clear Cart</button>
+            </div>
+
+            <p class="small-note">
+              Assistant Staff submits a request for review. Only authorized
+              Staff or Admin can finalize a sale.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="inventory" class="page">
+        <div class="page-heading">
+          <div>
+            <h2>Inventory</h2>
+            <p>View products and stock levels.</p>
+          </div>
+        </div>
+
+        <div id="inventorySummary" class="summary-grid"></div>
+
+        <div id="addProductPanel" class="panel">
+          <h3>Add New Product</h3>
+          <form id="productForm" class="product-form">
+            <div>
+              <label for="productName">Product name</label>
+              <input id="productName" required maxlength="80"
+                placeholder="e.g. Instant noodles">
+            </div>
+            <div>
+              <label for="costPrice">Cost price (₱)</label>
+              <input id="costPrice" type="number" min="0" step="0.01" required>
+            </div>
+            <div>
+              <label for="sellingPrice">Selling price (₱)</label>
+              <input id="sellingPrice" type="number" min="0" step="0.01" required>
+            </div>
+            <div>
+              <label for="initialStock">Starting stock</label>
+              <input id="initialStock" type="number" min="0" step="1" required>
+            </div>
+            <div>
+              <label for="minimumStock">Low-stock threshold</label>
+              <input id="minimumStock" type="number" min="0" step="1"
+                value="5" required>
+            </div>
+            <button type="submit" class="primary-btn">Add Product</button>
+          </form>
+        </div>
+
+        <div class="panel table-panel">
+          <h3>Product List</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th class="admin-only">Cost</th>
+                  <th>Selling Price</th>
+                  <th>Stock</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="inventoryTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="requests" class="page">
+        <div class="page-heading">
+          <div>
+            <h2 id="requestsTitle">Staff Requests</h2>
+            <p id="requestsSubtitle">Review Assistant Staff transactions.</p>
+          </div>
+          <select id="requestPeriod" aria-label="Request date filter">
+            <option value="today">Today</option>
+            <option value="month">This month</option>
+            <option value="year">This year</option>
+            <option value="all" selected>All dates</option>
+          </select>
+        </div>
+        <div id="requestList" class="request-list"></div>
+      </section>
+
+      <section id="consumption" class="page">
+        <div class="page-heading">
+          <div>
+            <h2>Store Consumption</h2>
+            <p>Record products taken from the store for personal use. No payment is collected.</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Record a Product Taken</h3>
+          <p id="consumptionWho" class="small-note"></p>
+
+          <div class="product-form">
+            <div>
+              <label for="consumptionProduct">Product</label>
+              <select id="consumptionProduct">
+                <option value="">Choose a product…</option>
+              </select>
+            </div>
+            <div>
+              <label for="consumptionQty">Quantity taken</label>
+              <input id="consumptionQty" type="number" min="1" step="1" placeholder="e.g. 1">
+            </div>
+            <div class="span-2">
+              <label for="consumptionNote">Reason or note (optional)</label>
+              <input id="consumptionNote" maxlength="200" placeholder="e.g. Snack during shift">
+            </div>
+            <p id="consumptionPreview" class="consumption-preview span-2"></p>
+            <button id="consumptionBtn" type="button" class="primary-btn">Record Consumption</button>
+          </div>
+
+          <p id="consumptionMessage" class="message" aria-live="polite"></p>
+          <p class="small-note">
+            This lowers the stock but is not a sale. It is never counted as income.
+            Records cannot be edited or deleted.
+          </p>
+        </div>
+
+        <div class="panel table-panel">
+          <h3>My recent records</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Product</th>
+                  <th>Qty</th>
+                  <th>Price</th>
+                  <th>Value</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="myConsumptionTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="reports" class="page">
+        <div class="page-heading">
+          <div>
+            <h2>Income Reports</h2>
+            <p>Summary of finalized sales only.</p>
+          </div>
+          <select id="reportPeriod" aria-label="Report period">
+            <option value="today">Today</option>
+            <option value="month">This month</option>
+            <option value="year">This year</option>
+            <option value="all">All time</option>
+          </select>
+        </div>
+
+        <div class="income-overview">
+          <h3 class="section-title">Income Overview</h3>
+          <p class="small-note">
+            Actual money received from completed customer sales only (Asia/Manila time).
+            These four totals always show and are not changed by the period selector.
+          </p>
+          <div id="incomeOverview" class="income-grid"></div>
+        </div>
+
+        <p class="small-note period-note">
+          The summary cards, product removal and sales table below follow the period selector above.
+        </p>
+
+        <div id="reportSummary" class="summary-grid"></div>
+
+        <div class="income-overview">
+          <h3 class="section-title">Product Performance</h3>
+          <p class="small-note">
+            Highlights from completed customer sales in the period selected above.
+          </p>
+          <div id="productHighlights"></div>
+        </div>
+
+        <div id="productRemovalPanel" class="panel admin-only">
+          <h3>Remove a Product from Inventory</h3>
+          <p class="small-note">
+            Removing a product hides it from the Cashier and Inventory totals.
+            All past sales, income and profit stay exactly as they are, and
+            nothing is permanently deleted. You can restore it later from the
+            Inventory page.
+          </p>
+          <div class="removal-row">
+            <select id="removeProductSelect" aria-label="Product to remove">
+              <option value="">Choose a product…</option>
+            </select>
+            <button id="removeProductBtn" type="button" class="danger-btn">Remove Product…</button>
+          </div>
+        </div>
+
+        <div class="panel table-panel">
+          <h3>Completed Sales</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Receipt</th>
+                  <th>Date</th>
+                  <th>Items</th>
+                  <th>Revenue</th>
+                  <th>Gross Profit</th>
+                  <th>Finalized By</th>
+                </tr>
+              </thead>
+              <tbody id="salesTable"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="income-overview consumption-report">
+          <h3 class="section-title">Store Consumption Report</h3>
+          <p class="small-note">
+            Products taken by Admin, Staff and Assistant Staff for personal use. This is
+            NOT income and is kept completely separate from the sales above.
+          </p>
+          <select id="consumptionPeriod" aria-label="Store Consumption period">
+            <option value="today">Today</option>
+            <option value="month">This month</option>
+            <option value="year">This year</option>
+            <option value="all">All time</option>
+          </select>
+
+          <div id="consumptionSummary" class="summary-grid"></div>
+
+          <div class="panel">
+            <h3>Income vs Consumption (selected period)</h3>
+            <div id="consumptionRecon"></div>
+          </div>
+
+          <div class="panel table-panel">
+            <h3>Store Consumption Records</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date &amp; Time</th>
+                    <th>Taken By</th>
+                    <th>Role</th>
+                    <th>Product</th>
+                    <th>Qty</th>
+                    <th>Price</th>
+                    <th>Total Value</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="consumptionTable"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="productReport" class="page admin-only">
+        <div class="page-heading">
+          <div>
+            <h2>Product Sales &amp; Income Report</h2>
+            <p>How every product performed. Completed customer sales only (Asia/Manila time).</p>
+          </div>
+          <select id="productReportPeriod" aria-label="Product report period">
+            <option value="today">Today</option>
+            <option value="month">This month</option>
+            <option value="year">This year</option>
+            <option value="all" selected>All time</option>
+          </select>
+        </div>
+
+        <p class="small-note period-note">
+          <strong>Revenue</strong> is the money received from sales. <strong>Gross profit</strong> is revenue minus
+          what the products cost at the time of the sale. The cards and the sales columns follow the period selector;
+          <strong>Remaining Stock</strong> is always the current stock. Store Consumption, restocking and
+          pending requests are never counted.
+        </p>
+
+        <div id="productReportSummary" class="income-grid"></div>
+        <div id="productReportNotes"></div>
+
+        <div class="panel table-panel">
+          <div class="panel-heading">
+            <h3>All Products</h3>
+            <div class="report-tools">
+              <input id="productReportSearch" type="search" placeholder="Search by name or product ID…" aria-label="Search products">
+              <select id="productReportPageSize" aria-label="Rows per page">
+                <option value="25" selected>25 per page</option>
+                <option value="50">50 per page</option>
+                <option value="100">100 per page</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th data-sort="name"><button type="button" class="sort-btn">Product Name</button></th>
+                  <th data-sort="id"><button type="button" class="sort-btn">Product ID</button></th>
+                  <th class="num" data-sort="qty"><button type="button" class="sort-btn">Quantity Sold</button></th>
+                  <th class="num" data-sort="revenue"><button type="button" class="sort-btn">Revenue</button></th>
+                  <th class="num" data-sort="profit"><button type="button" class="sort-btn">Gross Profit</button></th>
+                  <th class="num" data-sort="stock"><button type="button" class="sort-btn">Remaining Stock</button></th>
+                </tr>
+              </thead>
+              <tbody id="productReportTable"></tbody>
+            </table>
+          </div>
+          <div id="productReportPager" class="pager"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="pwa.js"></script>
+  <script type="module" src="app.js"></script></body>
+</html>

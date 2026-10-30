@@ -1,0 +1,501 @@
+rules_version = '2';
+
+// Yohan Store POS - Firestore Security Rules
+//
+// Roles come ONLY from the document users/{uid} (role + active).
+// Nobody can write to users/ from the app - the Admin edits it in the Firebase Console.
+//
+//   admin     : everything below
+//   staff     : cashier, restock, review requests, finalize sales
+//   assistant : read products, submit their own pending requests
+//
+// Costs (productCosts) and sales (income reports) are readable by Admin only.
+//
+// STAGE 2 CHANGES (marked "NEW"):
+//   1. products   : Admin may archive / restore a product (active flag).
+//   2. requests   : Admin may delete a request that is NOT linked to a sale,
+//                   and only together with an audit record.
+//   3. auditLogs  : new collection. Admin reads. Created only with a request delete. Never edited or deleted.
+//
+// STAGE 3 CHANGES (marked "NEW (Stage 3)"):
+//   4. users/{uid}/devices : push-notification tokens. Each Admin/Staff user can read,
+//                            add, refresh and remove ONLY their own devices.
+//
+// STORE CONSUMPTION CHANGES (marked "NEW (Consumption)"):
+//   5. storeConsumption    : new collection. Admin, Staff and Assistant Staff may each ADD
+//                            their own record (never edit or delete). Admin reads all;
+//                            everyone else reads only their own.
+//   6. products            : ONE extra way to lower stock: any active member may lower a
+//                            product's stock, but ONLY together with a brand-new storeConsumption
+//                            record of their own for exactly that quantity.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
+
+    // True when the signed-in user has an ACTIVE profile with one of these roles.
+    // If the profile document is missing, the read errors and access is denied.
+    function hasRole(allowed) {
+      let p = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return request.auth != null
+          && p.active == true
+          && p.role in allowed;
+    }
+
+    function isAdmin()     { return hasRole(['admin']); }
+    function isStaff()     { return hasRole(['staff']); }
+    function isAssistant() { return hasRole(['assistant']); }
+    function canSell()     { return hasRole(['admin', 'staff']); }
+    function isMember()    { return hasRole(['admin', 'staff', 'assistant']); }
+
+    // Which fields an update touches (use inside update rules only).
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // ---------------------------------------------------------------
+    // users - read your own profile only, never write
+    // ---------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // NEW (Stage 3) users/{uid}/devices - FCM tokens for push notifications.
+    // Only the owner, and only while an active Admin or Staff.
+    // Other users (and Assistant Staff) can never read these. The trusted sender
+    // (Cloud Functions, Stage 4) reads them with the Admin SDK, which bypasses rules.
+    // ---------------------------------------------------------------
+    match /users/{userId}/devices/{deviceId} {
+      allow read: if request.auth != null
+                  && request.auth.uid == userId
+                  && hasRole(['admin', 'staff']);
+
+      allow create: if request.auth != null
+                    && request.auth.uid == userId
+                    && hasRole(['admin', 'staff'])
+                    && validNewDevice();
+
+      // Seeing the same device again only refreshes lastSeenAt.
+      allow update: if request.auth != null
+                    && request.auth.uid == userId
+                    && hasRole(['admin', 'staff'])
+                    && changedKeys().hasOnly(['lastSeenAt'])
+                    && request.resource.data.lastSeenAt == request.time;
+
+      // Anyone may remove their own device record (even if later deactivated).
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    function validNewDevice() {
+      let d = request.resource.data;
+      let fields = ['token', 'userAgent', 'createdAt', 'lastSeenAt'];
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && d.token is string && d.token.size() >= 20 && d.token.size() <= 4096
+          && d.userAgent is string && d.userAgent.size() <= 200
+          && d.createdAt == request.time
+          && d.lastSeenAt == request.time;
+    }
+
+    // ---------------------------------------------------------------
+    // products - everyone active can read. No cost price is stored here.
+    // ---------------------------------------------------------------
+    match /products/{productId} {
+      allow read: if isMember();
+
+      // Admin adds a product (its cost record must be created in the same transaction).
+      allow create: if isAdmin() && validNewProduct(productId);
+
+      // Admin edits name / price / threshold.
+      // Admin or Staff change stock ONLY together with a sale or a restock record.
+      // NEW: Admin may archive or restore a product.
+      allow update: if (isAdmin() && validProductEdit())
+                    || (isAdmin() && validArchive())
+                    || (isAdmin() && validRestore())
+                    || (canSell() && validStockChange(productId))
+                    // NEW (Consumption): Admin, Staff or Assistant lowers stock ONLY with their own new record.
+                    || (isMember() && validConsumptionStockChange(productId));
+
+      allow delete: if isAdmin();
+    }
+
+    function validNewProduct(productId) {
+      let d = request.resource.data;
+      let fields = ['name', 'price', 'stock', 'minStock', 'createdAt', 'updatedAt'];
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && d.name is string && d.name.size() > 0 && d.name.size() <= 80
+          && d.price is number && d.price >= 0
+          && d.stock is int && d.stock >= 0
+          && d.minStock is int && d.minStock >= 0
+          && d.createdAt == request.time
+          && d.updatedAt == request.time
+          && existsAfter(/databases/$(database)/documents/productCosts/$(productId));
+    }
+
+    function validProductEdit() {
+      let d = request.resource.data;
+      return changedKeys().hasOnly(['name', 'price', 'minStock', 'updatedAt'])
+          && d.name is string && d.name.size() > 0 && d.name.size() <= 80
+          && d.price is number && d.price >= 0
+          && d.minStock is int && d.minStock >= 0
+          && d.updatedAt == request.time;
+    }
+
+    // NEW: archive = hide the product (active: false). Nothing else may change.
+    // Older products have no "active" field; that counts as active.
+    function validArchive() {
+      let before = resource.data;
+      let after = request.resource.data;
+      return (!('active' in before) || before.active == true)
+          && changedKeys().hasOnly(['active', 'archivedAt', 'archivedBy', 'archivedByUid', 'updatedAt'])
+          && after.active == false
+          && after.archivedAt == request.time
+          && after.archivedBy is string && after.archivedBy.size() <= 100
+          && after.archivedByUid == request.auth.uid
+          && after.updatedAt == request.time;
+    }
+
+    // NEW: restore = show the product again (active: true).
+    function validRestore() {
+      let before = resource.data;
+      let after = request.resource.data;
+      return ('active' in before) && before.active == false
+          && changedKeys().hasOnly(['active', 'restoredAt', 'restoredBy', 'restoredByUid', 'updatedAt'])
+          && after.active == true
+          && after.restoredAt == request.time
+          && after.restoredBy is string && after.restoredBy.size() <= 100
+          && after.restoredByUid == request.auth.uid
+          && after.updatedAt == request.time;
+    }
+
+    // NEW (Consumption): the ONLY stock change allowed for Assistant Staff.
+    //  - nothing else on the product may change (no name, price, threshold, archive...)
+    //  - stock must go DOWN, never below zero, and never on an archived product
+    //  - a brand-new storeConsumption record (dated right now, owned by THIS user, for THIS
+    //    product) must be saved in the same transaction, and its quantity must equal
+    //    exactly how much the stock went down
+    function validConsumptionStockChange(productId) {
+      let before = resource.data;
+      let after = request.resource.data;
+      return changedKeys().hasOnly(['stock', 'updatedAt', 'lastConsumptionId'])
+          && (!('active' in before) || before.active == true)
+          && after.updatedAt == request.time
+          && after.stock is int && after.stock >= 0
+          && after.stock < before.stock
+          && after.lastConsumptionId is string
+          && getAfter(/databases/$(database)/documents/storeConsumption/$(after.lastConsumptionId)).data.productId == productId
+          && getAfter(/databases/$(database)/documents/storeConsumption/$(after.lastConsumptionId)).data.userId == request.auth.uid
+          && getAfter(/databases/$(database)/documents/storeConsumption/$(after.lastConsumptionId)).data.date == request.time
+          && getAfter(/databases/$(database)/documents/storeConsumption/$(after.lastConsumptionId)).data.quantity == before.stock - after.stock;
+    }
+
+    function validStockChange(productId) {
+      let before = resource.data;
+      let after = request.resource.data;
+      return changedKeys().hasOnly(['stock', 'updatedAt', 'lastSaleReceipt', 'lastRestockId'])
+          && after.updatedAt == request.time
+          && after.stock is int && after.stock >= 0
+          && (
+               // SALE: stock goes down, and a brand-new sale (dated right now)
+               // is saved in the same transaction.
+               (after.stock < before.stock
+                 && after.lastSaleReceipt is string
+                 && getAfter(/databases/$(database)/documents/sales/$(after.lastSaleReceipt)).data.date == request.time)
+               ||
+               // RESTOCK: stock goes up by exactly the quantity in a brand-new restock record.
+               (after.stock > before.stock
+                 && after.stock - before.stock <= 100000
+                 && after.lastRestockId is string
+                 && getAfter(/databases/$(database)/documents/restocks/$(after.lastRestockId)).data.productId == productId
+                 && getAfter(/databases/$(database)/documents/restocks/$(after.lastRestockId)).data.quantity == after.stock - before.stock
+                 && getAfter(/databases/$(database)/documents/restocks/$(after.lastRestockId)).data.date == request.time)
+             );
+    }
+
+    // ---------------------------------------------------------------
+    // productCosts - Admin only (this is what hides cost prices from Staff)
+    // ---------------------------------------------------------------
+    match /productCosts/{productId} {
+      allow read: if isAdmin();
+
+      allow create: if isAdmin()
+                    && request.resource.data.keys().hasOnly(['history'])
+                    && request.resource.data.history is list
+                    && request.resource.data.history.size() == 1;
+
+      // The only allowed change: mark the cost record as belonging to a deleted product.
+      allow update: if isAdmin()
+                    && changedKeys().hasOnly(['deleted', 'deletedAt'])
+                    && request.resource.data.deleted == true
+                    && request.resource.data.deletedAt == request.time;
+
+      allow delete: if false;   // cost history is kept so old profit reports stay correct
+    }
+
+    // ---------------------------------------------------------------
+    // requests - Assistant Staff carts waiting for Staff/Admin
+    // ---------------------------------------------------------------
+    match /requests/{requestId} {
+      allow read: if isAdmin()
+                  || isStaff()
+                  || (isAssistant() && resource.data.assistantUid == request.auth.uid);
+
+      allow create: if isAssistant() && validNewRequest(requestId);
+
+      allow update: if canSell() && (validReview() || validFinalize(requestId));
+
+      // NEW: Admin may delete a request only if
+      //   - it is still pending, approved or rejected (never "completed"),
+      //   - it has no saleReceipt (it never became a sale), and
+      //   - an audit record DEL-<requestId> is written in the same transaction.
+      // Sales, income, stock and counters are untouched by this rule.
+      allow delete: if isAdmin()
+                    && resource.data.status in ['pending', 'approved', 'rejected']
+                    && !('saleReceipt' in resource.data)
+                    && existsAfter(/databases/$(database)/documents/auditLogs/$('DEL-' + requestId));
+    }
+
+    function validNewRequest(requestId) {
+      let d = request.resource.data;
+      let fields = ['assistantUid', 'assistantName', 'items', 'productIds', 'total',
+                    'cash', 'change', 'status', 'reviewedBy', 'finalizedBy', 'createdAt'];
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && requestId.matches('REQ-[0-9]{4,}')
+          && d.assistantUid == request.auth.uid
+          && d.assistantName is string && d.assistantName.size() <= 100
+          && d.items is list && d.items.size() > 0 && d.items.size() <= 50
+          && d.productIds is list && d.productIds.size() == d.items.size()
+          && d.total is number && d.total > 0
+          && d.cash is number && d.cash >= d.total
+          && d.change is number && d.change >= 0
+          && d.status == 'pending'
+          && d.reviewedBy == null
+          && d.finalizedBy == null
+          && d.createdAt == request.time;
+    }
+
+    // pending -> approved / rejected (no stock change, no income)
+    function validReview() {
+      let after = request.resource.data;
+      return resource.data.status == 'pending'
+          && after.status in ['approved', 'rejected']
+          && changedKeys().hasOnly(['status', 'reviewedBy', 'reviewedByUid', 'reviewedAt'])
+          && after.reviewedBy is string
+          && after.reviewedByUid == request.auth.uid
+          && after.reviewedAt == request.time;
+    }
+
+    // approved -> completed, only together with a brand-new sale for THIS request
+    function validFinalize(requestId) {
+      let after = request.resource.data;
+      return resource.data.status == 'approved'
+          && after.status == 'completed'
+          && changedKeys().hasOnly(['status', 'finalizedBy', 'finalizedByUid', 'finalizedAt', 'saleReceipt'])
+          && after.finalizedBy is string
+          && after.finalizedByUid == request.auth.uid
+          && after.finalizedAt == request.time
+          && after.saleReceipt is string
+          && getAfter(/databases/$(database)/documents/sales/$(after.saleReceipt)).data.sourceRequestId == requestId
+          && getAfter(/databases/$(database)/documents/sales/$(after.saleReceipt)).data.date == request.time;
+    }
+
+    // ---------------------------------------------------------------
+    // auditLogs (NEW) - who deleted which request, and when.
+    // Admin reads. Created only together with the request delete. Never edited or deleted.
+    // ---------------------------------------------------------------
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && validRequestDeleteLog(logId);
+      allow update, delete: if false;
+    }
+
+    function validRequestDeleteLog(logId) {
+      let d = request.resource.data;
+      let fields = ['action', 'requestId', 'requestStatus', 'requestTotal',
+                    'requestedBy', 'by', 'byUid', 'at'];
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && d.action == 'delete_request'
+          && d.requestId is string
+          && logId == 'DEL-' + d.requestId
+          && d.requestStatus in ['pending', 'approved', 'rejected']
+          && d.requestStatus == get(/databases/$(database)/documents/requests/$(d.requestId)).data.status
+          && d.requestTotal is number
+          && d.requestedBy is string && d.requestedBy.size() <= 100
+          && d.by is string && d.by.size() <= 100
+          && d.byUid == request.auth.uid
+          && d.at == request.time
+          // The request must really be deleted in the same transaction.
+          && !existsAfter(/databases/$(database)/documents/requests/$(d.requestId));
+    }
+
+    // ---------------------------------------------------------------
+    // storeConsumption (NEW) - products taken for personal use. NOT sales, NOT income.
+    // Anyone active may ADD a record that belongs to themselves. Records are never edited or deleted.
+    // Admin reads all of them; everyone else can read only their own.
+    // ---------------------------------------------------------------
+    match /storeConsumption/{recordId} {
+      // "get" must also work for a record that does not exist yet (the app checks this
+      // before saving, so a repeated click or a retry cannot create a duplicate).
+      allow get: if isAdmin()
+                 || (isMember() && (resource == null || resource.data.userId == request.auth.uid));
+
+      allow list: if isAdmin()
+                  || (isMember() && resource.data.userId == request.auth.uid);
+
+      allow create: if isMember() && validConsumption(recordId);
+      allow update, delete: if false;
+    }
+
+    function validConsumption(recordId) {
+      let d = request.resource.data;
+      let fields = ['type', 'productId', 'productName', 'quantity', 'unitPrice', 'total',
+                    'userId', 'userName', 'userRole', 'date', 'note'];
+      let profile = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      let hasName = ('name' in profile) && profile.name is string && profile.name.size() > 0;
+      let product = get(/databases/$(database)/documents/products/$(d.productId)).data;
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && recordId.matches('SC-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+          && d.type == 'store_consumption'
+          // product name and price must be the real ones right now (no made-up values)
+          && d.productId is string
+          && d.productName == product.name
+          && d.unitPrice is number && d.unitPrice == product.price
+          && d.quantity is int && d.quantity > 0 && d.quantity <= 10000
+          && d.total is number && d.total >= 0
+          && math.abs(d.total - d.quantity * d.unitPrice) < 0.005
+          // identity: must be the signed-in user, with their real role and name
+          && d.userId == request.auth.uid
+          && d.userRole == profile.role
+          && d.userName is string && d.userName.size() > 0 && d.userName.size() <= 100
+          && ((hasName && d.userName == profile.name)
+              || (!hasName && d.userName.lower() == request.auth.token.email.lower()))
+          && d.date == request.time
+          && d.note is string && d.note.size() <= 200
+          // stock: product is active, has enough stock, and drops by exactly this quantity
+          // in the same transaction (so it can never go negative)
+          && (!('active' in product) || product.active == true)
+          && product.stock is int && product.stock >= d.quantity
+          && getAfter(/databases/$(database)/documents/products/$(d.productId)).data.lastConsumptionId == recordId
+          && getAfter(/databases/$(database)/documents/products/$(d.productId)).data.stock == product.stock - d.quantity;
+    }
+
+    // ---------------------------------------------------------------
+    // sales - income records. Admin reads. Staff/Admin create. Never edited or deleted.
+    // ---------------------------------------------------------------
+    match /sales/{receiptId} {
+      allow read: if isAdmin();
+      allow create: if canSell() && validSale(receiptId);
+      allow update, delete: if false;
+    }
+
+    function validSale(receiptId) {
+      let d = request.resource.data;
+      let fields = ['receipt', 'items', 'total', 'cash', 'change', 'finalizedBy',
+                    'finalizedByUid', 'finalizedByRole', 'sourceRequestId', 'date'];
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && receiptId.matches('YS-[0-9]{5,}')
+          && d.receipt == receiptId
+          && d.items is list && d.items.size() > 0 && d.items.size() <= 50
+          && d.total is number && d.total > 0
+          && d.cash is number && d.cash >= d.total
+          && d.change is number && d.change >= 0
+          && d.finalizedBy is string
+          && d.finalizedByUid == request.auth.uid
+          && d.finalizedByRole == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+          && d.date == request.time
+          // The receipt counter must move forward in the same transaction.
+          && getAfter(/databases/$(database)/documents/counters/receipt).data.lastReceipt == receiptId
+          // A sale made from a request must complete that request in the same transaction.
+          && (d.sourceRequestId == null
+              || (d.sourceRequestId is string
+                  && getAfter(/databases/$(database)/documents/requests/$(d.sourceRequestId)).data.status == 'completed'
+                  && getAfter(/databases/$(database)/documents/requests/$(d.sourceRequestId)).data.saleReceipt == receiptId));
+    }
+
+    // ---------------------------------------------------------------
+    // restocks - audit record for every restock
+    // ---------------------------------------------------------------
+    match /restocks/{restockId} {
+      allow read: if isAdmin();
+      allow create: if canSell() && validRestock(restockId);
+      allow update, delete: if false;
+    }
+
+    function validRestock(restockId) {
+      let d = request.resource.data;
+      let fields = ['productId', 'name', 'quantity', 'previousStock', 'newStock',
+                    'byUid', 'by', 'date'];
+      return d.keys().hasOnly(fields)
+          && d.keys().hasAll(fields)
+          && d.productId is string
+          && d.quantity is int && d.quantity > 0 && d.quantity <= 100000
+          && d.previousStock is int
+          && d.newStock is int
+          && d.newStock == d.previousStock + d.quantity
+          && get(/databases/$(database)/documents/products/$(d.productId)).data.stock == d.previousStock
+          && d.byUid == request.auth.uid
+          && d.by is string && d.by.size() <= 100
+          && d.date == request.time
+          && getAfter(/databases/$(database)/documents/products/$(d.productId)).data.lastRestockId == restockId;
+    }
+
+    // ---------------------------------------------------------------
+    // counters - make IDs like REQ-0001, YS-00001, P001 (each can only go up by 1)
+    // ---------------------------------------------------------------
+    match /counters/receipt {
+      allow read: if canSell();
+      allow create: if canSell() && validReceiptCounter() && request.resource.data.n == 1;
+      allow update: if canSell() && validReceiptCounter()
+                    && request.resource.data.n == resource.data.n + 1;
+      allow delete: if false;
+    }
+
+    function validReceiptCounter() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['n', 'lastReceipt'])
+          && d.keys().hasAll(['n', 'lastReceipt'])
+          && d.n is int
+          && d.lastReceipt is string
+          && getAfter(/databases/$(database)/documents/sales/$(d.lastReceipt)).data.date == request.time;
+    }
+
+    match /counters/request {
+      allow read: if isAssistant();
+      allow create: if isAssistant()
+                    && request.resource.data.keys().hasOnly(['n'])
+                    && request.resource.data.n == 1;
+      allow update: if isAssistant()
+                    && request.resource.data.keys().hasOnly(['n'])
+                    && request.resource.data.n == resource.data.n + 1;
+      allow delete: if false;
+    }
+
+    match /counters/product {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+                    && request.resource.data.keys().hasOnly(['n'])
+                    && request.resource.data.n == 1;
+      allow update: if isAdmin()
+                    && request.resource.data.keys().hasOnly(['n'])
+                    && request.resource.data.n == resource.data.n + 1;
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // Everything else stays locked.
+    // ---------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
